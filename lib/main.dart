@@ -33,7 +33,10 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
   bool _isLongPressing = false;
   bool _uploading = false;
 
-  List<List<dynamic>> _dataRows = [];
+  // 位置情報と加速度センサのデータを別々に保持
+  List<List<dynamic>> _locationDataRows = [];
+  List<List<dynamic>> _accelDataRows = [];
+
   Timer? _locationTimer;
   StreamSubscription<AccelerometerEvent>? _accelSub;
   DateTime? _recordStartTime;
@@ -51,31 +54,33 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
   Future<void> _requestPermissions() async {
     await Geolocator.requestPermission();
     await Permission.sensors.request();
+    await Permission.storage.request(); // ファイル保存のためのストレージ権限も追加
   }
 
   void _startRecording() {
     setState(() {
       _isRecording = true;
       _recordStartTime = DateTime.now();
-      _dataRows = [];
-      _dataRows.add([
-        "timestamp(ms)",
-        "latitude",
-        "longitude",
-        "accelX",
-        "accelY",
-        "accelZ"
-      ]);
+      _locationDataRows = [];
+      _accelDataRows = [];
+
+      // 位置情報用のヘッダー
+      _locationDataRows.add(["timestamp(ms)", "latitude", "longitude"]);
+
+      // 加速度センサ用のヘッダー
+      _accelDataRows.add(["timestamp(ms)", "accelX", "accelY", "accelZ"]);
     });
 
+    // 位置情報を1Hzで取得
     _locationTimer = Timer.periodic(Duration(seconds: 1), (timer) async {
       Position pos = await Geolocator.getCurrentPosition(
           desiredAccuracy: LocationAccuracy.high);
-      _recordData(position: pos);
+      _recordLocationData(position: pos);
     });
 
+    // 加速度センサを60Hz（約16ms間隔）で取得
     _accelSub = accelerometerEvents.listen((event) {
-      _recordData(accelX: event.x, accelY: event.y, accelZ: event.z);
+      _recordAccelData(accelX: event.x, accelY: event.y, accelZ: event.z);
     });
   }
 
@@ -87,33 +92,59 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
       _isRecording = false;
     });
 
-    // データをCSVに変換
-    String csvData = const ListToCsvConverter().convert(_dataRows);
+    // 位置情報をCSVに変換
+    String locationCsv = const ListToCsvConverter().convert(_locationDataRows);
 
-    // ローカルへ一旦保存(必要であれば)
+    // 加速度センサデータをCSVに変換
+    String accelCsv = const ListToCsvConverter().convert(_accelDataRows);
+
+    // ローカルへ保存
     final directory = await getApplicationDocumentsDirectory();
-    final filePath =
-        "${directory.path}/sensor_data_${DateTime.now().millisecondsSinceEpoch}.csv";
-    final file = File(filePath);
-    await file.writeAsString(csvData);
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final locationFilePath = "${directory.path}/location_data_$timestamp.csv";
+    final accelFilePath = "${directory.path}/accel_data_$timestamp.csv";
+
+    final locationFile = File(locationFilePath);
+    final accelFile = File(accelFilePath);
+
+    await locationFile.writeAsString(locationCsv);
+    await accelFile.writeAsString(accelCsv);
 
     // S3へアップロード (Lambda経由)
     setState(() {
       _uploading = true;
     });
     try {
-      final csvBase64 = base64Encode(csvData.codeUnits);
-      final response = await http.post(Uri.parse(lambdaUrl),
+      // 位置情報ファイルのアップロード
+      final locationCsvBase64 = base64Encode(locationCsv.codeUnits);
+      final locationResponse = await http.post(Uri.parse(lambdaUrl),
           headers: {"Content-Type": "application/json"},
           body: jsonEncode({
-            "filename": "data_${DateTime.now().millisecondsSinceEpoch}.csv",
-            "filedata_base64": csvBase64
+            "filename": "location_data_$timestamp.csv",
+            "filedata_base64": locationCsvBase64
           }));
 
-      if (response.statusCode == 200) {
-        print("Upload success");
+      if (locationResponse.statusCode == 200) {
+        print("Location data upload success");
       } else {
-        print("Upload failed: ${response.statusCode}, ${response.body}");
+        print(
+            "Location data upload failed: ${locationResponse.statusCode}, ${locationResponse.body}");
+      }
+
+      // 加速度センサファイルのアップロード
+      final accelCsvBase64 = base64Encode(accelCsv.codeUnits);
+      final accelResponse = await http.post(Uri.parse(lambdaUrl),
+          headers: {"Content-Type": "application/json"},
+          body: jsonEncode({
+            "filename": "accel_data_$timestamp.csv",
+            "filedata_base64": accelCsvBase64
+          }));
+
+      if (accelResponse.statusCode == 200) {
+        print("Accelerometer data upload success");
+      } else {
+        print(
+            "Accelerometer data upload failed: ${accelResponse.statusCode}, ${accelResponse.body}");
       }
     } catch (e) {
       print("Upload error: $e");
@@ -124,18 +155,25 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
     });
   }
 
-  void _recordData(
-      {Position? position, double? accelX, double? accelY, double? accelZ}) {
+  void _recordLocationData({Position? position}) {
     final now = DateTime.now();
     final elapsedMs = _recordStartTime == null
         ? 0
         : now.millisecondsSinceEpoch - _recordStartTime!.millisecondsSinceEpoch;
     double lat = position?.latitude ?? double.nan;
     double lon = position?.longitude ?? double.nan;
+    _locationDataRows.add([elapsedMs, lat, lon]);
+  }
+
+  void _recordAccelData({double? accelX, double? accelY, double? accelZ}) {
+    final now = DateTime.now();
+    final elapsedMs = _recordStartTime == null
+        ? 0
+        : now.millisecondsSinceEpoch - _recordStartTime!.millisecondsSinceEpoch;
     double ax = accelX ?? double.nan;
     double ay = accelY ?? double.nan;
     double az = accelZ ?? double.nan;
-    _dataRows.add([elapsedMs, lat, lon, ax, ay, az]);
+    _accelDataRows.add([elapsedMs, ax, ay, az]);
   }
 
   void _onLongPressStart(LongPressStartDetails details) {
