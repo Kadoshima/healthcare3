@@ -31,11 +31,12 @@ dependencies:
   flutter:
     sdk: flutter
   geolocator: ^13.0.2
-  sensors_plus: ^6.1.1
   http: ^1.2.2
   path_provider: ^2.1.5
   permission_handler: ^11.3.1
-
+  csv: ^6.0.0
+  shared_preferences: ^2.3.3
+  dchs_motion_sensors: ^2.0.0
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
