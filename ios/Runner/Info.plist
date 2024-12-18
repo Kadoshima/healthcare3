@@ -51,5 +51,12 @@
 	<key>NSMotionUsageDescription</key>
 	<string>加速度情報を取得します</string>
 
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>このアプリはBLEデバイスに接続するため、Bluetoothが必要です。</string>
+
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>このアプリはBLEスキャンのために、近くの位置情報権限が必要です。</string>
+
+
 </dict>
 </plist>

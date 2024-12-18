@@ -2,12 +2,13 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:dchs_motion_sensors/dchs_motion_sensors.dart'; // dchs_motion_sensorsを使用
+import 'package:dchs_motion_sensors/dchs_motion_sensors.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
-import 'package:shared_preferences/shared_preferences.dart'; // 追加
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart'; // BLE用
 
 void main() {
   runApp(const MyApp());
@@ -55,7 +56,7 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
   List<List<dynamic>> _accelDataRows = [];
 
   Timer? _locationTimer;
-  StreamSubscription<AccelerometerEvent>? _accelSub;
+  StreamSubscription? _accelSub;
   DateTime? _recordStartTime;
 
   final String lambdaUrl =
@@ -63,21 +64,30 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
 
   String? _userName;
 
+  // BLE関連
+  BluetoothDevice? _connectedDevice;
+  BluetoothCharacteristic? _heartRateCharacteristic;
+  int? _currentHeartRate; // 最後に取得した心拍数
+  bool _bleConnected = false;
+  StreamSubscription<List<ScanResult>>? _scanSubscription;
+  List<ScanResult> _scanResultsList = [];
+
   @override
   void initState() {
     super.initState();
     _requestPermissions();
     _checkUserName();
-    // 加速度センサー取得頻度を設定（例：100Hz相当）
-    // 1秒=1,000,000マイクロ秒, 100Hz→1秒/100=0.01秒=10ms=10000マイクロ秒
+    // 加速度センサー取得頻度を100Hz程度
     motionSensors.accelerometerUpdateInterval =
         Duration.microsecondsPerSecond ~/ 100;
   }
 
   Future<void> _requestPermissions() async {
+    // 必要なパーミッション要求
     await Geolocator.requestPermission();
     await Permission.sensors.request();
     await Permission.storage.request();
+    await Permission.location.request();
   }
 
   Future<void> _checkUserName() async {
@@ -127,9 +137,15 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
     );
   }
 
-  void _startRecording() {
+  Future<void> _startRecording() async {
     if (_userName == null || _userName!.isEmpty) {
       _showNameInputDialog();
+      return;
+    }
+
+    if (!_bleConnected) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("デバイス未接続のため録画開始できません")));
       return;
     }
 
@@ -139,7 +155,9 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
       _locationDataRows = [];
       _accelDataRows = [];
 
-      _locationDataRows.add(["timestamp(ms)", "latitude", "longitude"]);
+      // CSVにheartRateカラムを追加
+      _locationDataRows
+          .add(["timestamp(ms)", "latitude", "longitude", "heartRate"]);
       _accelDataRows.add(["timestamp(ms)", "accelX", "accelY", "accelZ"]);
     });
 
@@ -150,10 +168,130 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
       _recordLocationData(position: pos);
     });
 
-    // 加速度センサデータ取得（dchs_motion_sensors）
+    // 加速度データ取得
     _accelSub = motionSensors.accelerometer.listen((event) {
       _recordAccelData(accelX: event.x, accelY: event.y, accelZ: event.z);
     });
+  }
+
+  // デバイス検索・接続処理
+  Future<void> _reloadAndConnectDevice() async {
+    // スキャン開始前にリストを初期化
+    _scanResultsList.clear();
+    await FlutterBluePlus.startScan(timeout: Duration(seconds: 5));
+    _scanSubscription?.cancel();
+    _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
+      setState(() {
+        _scanResultsList = results;
+      });
+    });
+
+    await Future.delayed(Duration(seconds: 5));
+    await FlutterBluePlus.stopScan();
+
+    // スキャンが完了したら、ユーザーにデバイスを選ばせる
+    if (_scanResultsList.isEmpty) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("デバイスが見つかりませんでした")));
+      return;
+    }
+
+    _showDeviceSelectionDialog();
+  }
+
+  void _showDeviceSelectionDialog() {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("接続するデバイスを選択"),
+          content: Container(
+            width: double.maxFinite,
+            height: 200,
+            child: ListView.builder(
+              itemCount: _scanResultsList.length,
+              itemBuilder: (context, index) {
+                final device = _scanResultsList[index].device;
+                final name = device.name.isNotEmpty ? device.name : "(No name)";
+                return ListTile(
+                  title: Text(name),
+                  subtitle: Text(device.id.toString()),
+                  onTap: () {
+                    Navigator.of(context).pop();
+                    _connectToSelectedDevice(device);
+                  },
+                );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _connectToSelectedDevice(BluetoothDevice device) async {
+    setState(() {
+      _bleConnected = false;
+      _connectedDevice = null;
+      _heartRateCharacteristic = null;
+      _currentHeartRate = null;
+    });
+
+    try {
+      await device.connect();
+    } catch (e) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("接続に失敗しました: $e")));
+      return;
+    }
+    _connectedDevice = device;
+
+    List<BluetoothService> services = await device.discoverServices();
+
+    // Heart Rate Service探索
+    final heartRateServiceList = services
+        .where((s) => s.uuid.toString().toLowerCase().contains("180d"))
+        .toList();
+    BluetoothService? heartRateService =
+        heartRateServiceList.isNotEmpty ? heartRateServiceList.first : null;
+
+    if (heartRateService == null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("心拍センサーサービスが見つかりませんでした")));
+      await device.disconnect();
+      return;
+    }
+
+    // Heart Rate Measurement Char探索
+    final hrCharList = heartRateService.characteristics
+        .where((c) => c.uuid.toString().toLowerCase().contains("2a37"))
+        .toList();
+    BluetoothCharacteristic? hrChar =
+        hrCharList.isNotEmpty ? hrCharList.first : null;
+
+    if (hrChar == null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text("心拍数計測キャラクタリスティックが見つかりませんでした")));
+      await device.disconnect();
+      return;
+    }
+
+    _heartRateCharacteristic = hrChar;
+    await hrChar.setNotifyValue(true);
+    hrChar.value.listen((value) {
+      if (value.isNotEmpty) {
+        int hr = value[1];
+        setState(() {
+          _currentHeartRate = hr;
+        });
+      }
+    });
+
+    setState(() {
+      _bleConnected = true;
+    });
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text("デバイス '${device.name}' に接続しました")));
   }
 
   Future<void> _stopRecording() async {
@@ -234,7 +372,8 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
     final elapsedMs = now.millisecondsSinceEpoch;
     double lat = position?.latitude ?? double.nan;
     double lon = position?.longitude ?? double.nan;
-    _locationDataRows.add([elapsedMs, lat, lon]);
+    double hr = _currentHeartRate?.toDouble() ?? double.nan;
+    _locationDataRows.add([elapsedMs, lat, lon, hr]);
   }
 
   void _recordAccelData({double? accelX, double? accelY, double? accelZ}) {
@@ -270,6 +409,25 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
 
   @override
   Widget build(BuildContext context) {
+    // BLE接続状態とデバイス名表示用ウィジェット
+    Widget connectionIndicator = Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            color: _bleConnected ? Colors.green : Colors.red,
+            shape: BoxShape.circle,
+          ),
+        ),
+        SizedBox(width: 5),
+        Text(_connectedDevice?.name.isNotEmpty == true
+            ? _connectedDevice!.name
+            : "No Device")
+      ],
+    );
+
     return Scaffold(
       appBar: AppBar(
         title: Text("Sensor Recorder"),
@@ -278,6 +436,20 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
           onPressed: _resetUserName,
           tooltip: "氏名変更",
         ),
+        actions: [
+          // リロードボタン: デバイスを再スキャンし、ユーザーに選択させる
+          IconButton(
+            icon: Icon(Icons.refresh),
+            onPressed: () {
+              _reloadAndConnectDevice();
+            },
+            tooltip: "リロード",
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+            child: connectionIndicator,
+          )
+        ],
       ),
       body: Container(
         decoration: BoxDecoration(
@@ -287,27 +459,44 @@ class _SensorRecorderPageState extends State<SensorRecorderPage> {
         child: Center(
           child: _uploading
               ? CircularProgressIndicator()
-              : _isRecording
-                  ? GestureDetector(
-                      onLongPressStart: _onLongPressStart,
-                      onLongPressEnd: _onLongPressEnd,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.redAccent,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        padding: EdgeInsets.all(20),
-                        child: Text(
-                          "END (長押し3秒)",
-                          style: TextStyle(
-                              color: Colors.white, fontWeight: FontWeight.bold),
-                        ),
+              : Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // START後に心拍数表示
+                    if (_isRecording)
+                      Text(
+                        _currentHeartRate != null
+                            ? "Heart Rate: $_currentHeartRate bpm"
+                            : "Heart Rate: ---",
+                        style: TextStyle(
+                            fontSize: 24, fontWeight: FontWeight.bold),
                       ),
-                    )
-                  : ElevatedButton(
-                      onPressed: _startRecording,
-                      child: Text("START"),
-                    ),
+                    SizedBox(height: 20),
+                    _isRecording
+                        ? GestureDetector(
+                            onLongPressStart: _onLongPressStart,
+                            onLongPressEnd: _onLongPressEnd,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: Colors.redAccent,
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              padding: EdgeInsets.all(20),
+                              child: Text(
+                                "END (長押し3秒)",
+                                style: TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          )
+                        : ElevatedButton(
+                            onPressed: _bleConnected ? _startRecording : null,
+                            // 接続前はnullで無効化
+                            child: Text("START"),
+                          ),
+                  ],
+                ),
         ),
       ),
     );
